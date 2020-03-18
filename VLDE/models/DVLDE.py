@@ -332,8 +332,7 @@ class DDPAE(BaseModel):
     param sample: True if this is called by guide(), and sample with pyro.sample.
     Return latent: a dictionary {'pose': pose, 'content': content, ...}
     '''
-    input_latent_mu, input_latent_sigma, pred_latent_mu, pred_latent_sigma,\
-        initial_pose_mu, initial_pose_sigma = self.pose_model(input)
+    man = self.pose_model(input)
 
     # Sample latent variables
     latent = self.sample_latent(input, input_latent_mu, input_latent_sigma, pred_latent_mu,

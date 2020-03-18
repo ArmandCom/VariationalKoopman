@@ -84,7 +84,7 @@ def _get_neigh_dist(M, neigh):
     Kjj = []
     for b in range(M.size(0)):
         Kjj.append(K[b,j[b,:],j[b,:]].unsqueeze(0))
-    # TODO: try b = range(M.size(0), kjj = K[b, j[b], j[b]]
+        # TODO: try b = range(M.size(0), kjj = K[b, j[b], j[b]]
     Kjj = torch.cat(Kjj,0)
     dist = Kii + Kjj - 2*Kij # TODO: check why this is sometimes negative, substitute for a more appropriate fn.
     return dist
@@ -188,18 +188,27 @@ class Loss(ELBO):
             args = args[0:2]
 
         elbo = 0.0
+        dyn_loss = 0.0
+        dim_loss = 0.0
+
         # grab a trace from the generator
         for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
             elbo_particle = 0
             surrogate_elbo_particle = 0
             log_r = None
 
-            loss_test = 0
+            ys = []
             # compute elbo and surrogate elbo
             for name, site in model_trace.nodes.items():
                 if site["type"] == "sample":
                     elbo_particle = elbo_particle + torch_item(site["log_prob_sum"])
                     surrogate_elbo_particle = surrogate_elbo_particle + site["log_prob_sum"]
+
+                    if site["name"].startswith("y_"):
+                        ys.append(site["value"])
+            man = torch.stack(ys, dim=1)
+            mean_man = man.mean(dim=1, keepdims=True)
+            man = man - mean_man
 
             for name, site in guide_trace.nodes.items():
                 if site["type"] == "sample":
@@ -224,8 +233,7 @@ class Loss(ELBO):
                                    for site in trace.nodes.values())
 
             if trainable_params and getattr(surrogate_elbo_particle, 'requires_grad', False):
-                #TODO: check pyro example for adding a regularization value lambda
-                surrogate_loss_particle = -surrogate_elbo_particle / self.num_particles + loss_test
+                surrogate_loss_particle = -surrogate_elbo_particle / self.num_particles
                 surrogate_loss_particle.backward()
 
         loss = -elbo

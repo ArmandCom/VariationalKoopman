@@ -52,7 +52,7 @@ class Encoder(nn.Module):
     '''TIME ENCODING'''
     self.feat_latent_size = n_dim# Note: future feature extractor
     input_repr = input.view(batch_size, n_frames_input, self.feat_latent_size)
-    _, time_enc = self.time_enc_rnn(input_repr) #
+    full_time_enc, time_enc = self.time_enc_rnn(input_repr) #
     time_enc = time_enc.view(2, batch_size, -1)
 
 
