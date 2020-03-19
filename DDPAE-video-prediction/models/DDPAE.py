@@ -8,7 +8,8 @@ import torch.nn.functional as F
 import pyro
 import pyro.distributions as dist
 import pyro.optim as optim
-from pyro.infer import SVI, Trace_ELBO
+from pyro.infer import SVI #, Trace_ELBO
+from custom_trace_elbo import Trace_ELBO
 
 from .base_model import BaseModel
 from models.networks.pose_rnn import PoseRNN

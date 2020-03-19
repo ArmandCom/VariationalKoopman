@@ -115,7 +115,7 @@ class Loss(ELBO):
             guide_trace = prune_subsample_sites(guide_trace)
             model_trace = prune_subsample_sites(model_trace)
 
-            # model_trace.compute_log_prob() # TODO: no va perque no hi ha parametres de decoder
+            model_trace.compute_log_prob()
             guide_trace.compute_score_parts()
 
             if is_validation_enabled():
@@ -189,6 +189,13 @@ class Loss(ELBO):
                     elbo_particle = elbo_particle + torch_item(site["log_prob_sum"])
                     surrogate_elbo_particle = surrogate_elbo_particle + site["log_prob_sum"]
 
+                    if site["name"] == "obs":
+                        man = site["value"]
+                        mean_man = man.mean(dim=1, keepdims=True)
+                        man = man - mean_man
+                        dyn_loss += self._get_logdet_loss(man, delta=self.delta)  # TODO: Normalize
+                        dim_loss += self._get_traceK_loss(man)
+
             for name, site in guide_trace.nodes.items():
                 if site["type"] == "sample":
                     log_prob, score_function_term, entropy_term = site["score_parts"]
@@ -204,14 +211,6 @@ class Loss(ELBO):
                         site = log_r.sum_to(site["cond_indep_stack"])
                         surrogate_elbo_particle = surrogate_elbo_particle + (site * score_function_term).sum()
 
-                    if site["name"].startswith("y_"):
-                        # TODO: check order of y
-                        ys.append(site["value"])
-            man = torch.stack(ys, dim=1)
-            mean_man = man.mean(dim=1, keepdims=True)
-            man = man - mean_man
-            dyn_loss += self._get_logdet_loss(man, delta=self.delta)  # TODO: Normalize
-            dim_loss += self._get_traceK_loss(man)
             elbo += elbo_particle / self.num_particles
 
             # collect parameters to train from model and guide
@@ -228,4 +227,4 @@ class Loss(ELBO):
         loss = -elbo
         if torch_isnan(loss):
             warnings.warn('Encountered NAN loss')
-        return loss, dyn_loss.item(), dim_loss.item(), man
+        return loss, dyn_loss, dim_loss, man

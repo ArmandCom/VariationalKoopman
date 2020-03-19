@@ -13,7 +13,7 @@ from models.custom_loss import Loss, _get_Gram, _get_Kernel
 
 from .base_model import BaseModel
 # from models.networks.pose_rnn import PoseRNN
-from models.networks.mapping_rnn import ManifoldEncoder
+from models.networks.mapping_rnn import Encoder, Decoder
 
 import matplotlib
 matplotlib.use('Agg')
@@ -70,6 +70,12 @@ class DVLDE(BaseModel):
     self.y_prior_mu = Variable(torch.cuda.FloatTensor([0]*self.manifold_size))
     self.y_prior_sigma = Variable(torch.cuda.FloatTensor([1]*self.manifold_size))
 
+    self.time_enc_prior_mu = Variable(torch.cuda.FloatTensor([0]*self.time_enc_size))
+    self.time_enc_prior_sigma = Variable(torch.cuda.FloatTensor([1]*self.time_enc_size))
+
+    self.feat_prior_mu = Variable(torch.zeros(self.n_frames_input, self.feat_latent_size).cuda())
+    self.feat_prior_sigma = Variable(torch.ones(self.n_frames_input, self.feat_latent_size).cuda())
+
   def setup_networks(self):
     '''
     Networks for DVLDE.
@@ -79,21 +85,21 @@ class DVLDE(BaseModel):
     self.model_modules = {}
     self.guide_modules = {}
 
-    # Backbone, Mapping RNN
-    mapping_model = ManifoldEncoder(self.n_frames_input, self.n_frames_output, self.n_channels, self.image_size,
+    # Encoder Features
+    encoder_model = Encoder(self.n_frames_input, self.n_frames_output, self.n_channels, self.image_size,
                                     self.feat_latent_size, self.time_enc_size, self.t_enc_rnn_hidden_size,
-                                    self.trans_rnn_hidden_size, self.manifold_size, self.ngf)
+                                  self.trans_rnn_hidden_size, self.manifold_size, self.ngf)
+    self.encoder_model = nn.DataParallel(encoder_model.cuda())
+    self.nets['encoder_model'] = self.encoder_model
+    self.guide_modules['encoder_model'] = self.encoder_model
+
+    # Backbone, Mapping RNN
+    mapping_model = Decoder(self.n_frames_input, self.n_frames_output,
+                                    self.feat_latent_size, self.time_enc_size, self.t_enc_rnn_hidden_size,
+                                    self.trans_rnn_hidden_size, self.manifold_size)
     self.mapping_model = nn.DataParallel(mapping_model.cuda())
     self.nets['mapping_model'] = self.mapping_model
-    self.guide_modules['mapping_model'] = self.mapping_model
-
-    # For decoding to image
-    # n_layers = int(np.log2(self.image_size)) - 1
-    # object_decoder = ImageDecoder(self.feat_latent_size, self.n_channels,
-    #                               self.ngf, n_layers, 'sigmoid')
-    # self.object_decoder = nn.DataParallel(object_decoder.cuda())
-    # self.nets.update({'object_decoder': self.object_decoder})
-    # self.model_modules['decoder'] = self.object_decoder
+    self.model_modules['mapping_model'] = self.mapping_model
 
   def setup_training(self):
     '''
@@ -126,22 +132,23 @@ class DVLDE(BaseModel):
 
     batch_size = input.size(0)
     # y prior
-    N = batch_size
+    N = batch_size  #TODO: check it's repeating well
+
+    feat_prior_mu = self.feat_prior_mu.repeat(N,1,1)
+    feat_prior_sigma = self.feat_prior_sigma.repeat(N, 1,1)
+    input_repr = self.pyro_sample('features', dist.Normal, feat_prior_mu, feat_prior_sigma, sample=True)
+
     y_prior_mu = self.y_prior_mu.repeat(N,1)
     y_prior_sigma = self.y_prior_sigma.repeat(N, 1)
-    ys = []
-    for t in range(self.n_frames_input):
-      y = self.pyro_sample('y_{:d}'.format(t), dist.Normal, y_prior_mu, y_prior_sigma, sample=True)
-      ys.append(y)
-    man = torch.stack(ys, dim=1)
+    y0 = self.pyro_sample('y_0', dist.Normal, y_prior_mu, y_prior_sigma, sample=True)
 
-    latent.update({'manifold': man})
+    time_enc_prior_mu = self.time_enc_prior_mu.repeat(N,1)
+    time_enc_prior_sigma = self.time_enc_prior_sigma.repeat(N, 1)
+    time_enc = self.pyro_sample('time_enc', dist.Normal, time_enc_prior_mu, time_enc_prior_sigma, sample=True)
+
+    latent.update({'features': input_repr, 'y_0': y0, 'time_enc': time_enc})
+
     return latent
-
-  def sample_content(self, content, sample):
-    # TODO: constant vector for skip connections also stochastic
-    content = None
-    return content
 
   def get_neigh_dist(self, man, neigh):
 
@@ -168,11 +175,11 @@ class DVLDE(BaseModel):
     param sample: True if this is called by guide(), and sample with pyro.sample.
     Return latent: a dictionary {'manifold': man}
     '''
-    man = self.mapping_model(input, sample)
+    input_repr, time_enc, y0 = self.encoder_model(input, sample)
     latent = defaultdict(lambda: None)
-    latent.update({'manifold': man})
+    latent.update({'y_0': y0, 'time_enc': time_enc})
 
-    return latent
+    return input_repr, latent
 
   def decode(self, neigh, latent, batch_size):
     '''
@@ -181,9 +188,11 @@ class DVLDE(BaseModel):
     Return values:
     knn_dist: Distances to all the neighbors in time
     '''
-    man = latent['manifold']
+    input_repr = latent['features']
+    time_enc = latent['time_enc']
+    y0 = latent['y_0']
+    man = self.mapping_model(input_repr, time_enc, y0)
     man_dists = self.get_neigh_dist(man, neigh)
-    # latent.update({'knn_distances': knn_dist})
 
     return man_dists, man
 
@@ -265,7 +274,9 @@ class DVLDE(BaseModel):
     output = Variable(output.cuda())
     neigh = Variable(neigh.cuda())
     ori_dists = Variable(ori_dists.cuda())
+
     batch_size, _, _, _, W = input.size()
+    output = Variable(output.cuda())
 
     # gt = torch.cat([input, output], dim=1)
     gt = ori_dists

@@ -1,9 +1,8 @@
+
 from __future__ import absolute_import, division, print_function
 
 import warnings
-
-import torch
-import torch.nn as nn
+import weakref
 
 import pyro
 import pyro.poutine as poutine
@@ -25,51 +24,8 @@ def _compute_log_r(model_trace, guide_trace):
             log_r.add((stacks[name], log_r_term.detach()))
     return log_r
 
-def _get_Gram(M):
-    '''
-    M: [*, T, f] --  T = n_frames_input
-    G: [*, T/2 -1, T/2 -1] -- T/2 -1 = autoregressor_size
-    '''
-    size_G = M.size(1) // 2 + M.size(1) % 2
-    G = torch.zeros(M.size(0), size_G, size_G).cuda()
-    # meanK = get_K(M).mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)
-    for i in range(M.size(1) - size_G + 1):
-        a = M[:, i:i + size_G]
-        G += torch.bmm(a, a.permute(0, 2, 1))  # - meanK # With unbias
-    return G
 
-def _get_Kernel(M):
-    return torch.bmm(M, M.permute(0, 2, 1))
-
-def _get_matrix_trace(M, flag='k'):
-    '''
-    :param M: [*, T, f] --  T = n_frames_input
-    :return: scalar
-    '''
-    if flag == 'k':
-        vecM = M.contiguous().view(M.size(0), 1, -1)
-        tr = torch.bmm(vecM, vecM.permute(0, 2, 1))
-
-        # With unbias
-        # meanK = get_K(M).mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)
-        # tr = (vecM**2 - meanK).sum(dim=2, keepdim=True)
-    elif flag == 'g':
-        tr = 0
-        size_G = M.size(1) // 2 + M.size(1) % 2
-        # meanK = get_K(M).mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)
-        for i in range(M.size(1) - size_G + 1):
-            a = M[:, i:i + size_G]
-            veca = a.contiguous().view(a.size(0), 1, -1)
-            tr += torch.bmm(veca, veca.permute(0, 2, 1))
-
-            # With unbias
-            # tr += (veca ** 2 - meanK).sum(dim=2, keepdim=True)
-    else:
-        warnings.warn('Wrong flag: choose either k or g.')
-        raise NotImplementedError
-    return tr
-
-class Loss(ELBO):
+class Trace_ELBO(ELBO):
     """
     A trace implementation of ELBO-based SVI. The estimator is constructed
     along the lines of references [1] and [2]. There are no restrictions on the
@@ -88,12 +44,6 @@ class Loss(ELBO):
     [2] Black Box Variational Inference,
         Rajesh Ranganath, Sean Gerrish, David M. Blei
     """
-    def __init__(self, lam, gam, eps, delta):
-        super(Loss, self).__init__()
-        self.lam = lam # Weight of dynamics loss
-        self.gam = gam # Weight of dimensionality loss
-        self.eps = eps # Slack variable for local geometry
-        self.delta = delta # To ensure logdet stability
 
     def _get_traces(self, model, guide, *args, **kwargs):
         """
@@ -115,9 +65,8 @@ class Loss(ELBO):
             guide_trace = prune_subsample_sites(guide_trace)
             model_trace = prune_subsample_sites(model_trace)
 
-            # model_trace.compute_log_prob() # TODO: no va perque no hi ha parametres de decoder
+            model_trace.compute_log_prob()
             guide_trace.compute_score_parts()
-
             if is_validation_enabled():
                 for site in model_trace.nodes.values():
                     if site["type"] == "sample":
@@ -127,21 +76,6 @@ class Loss(ELBO):
                         check_site_shape(site, self.max_iarange_nesting)
 
             yield model_trace, guide_trace
-
-    def _get_logdet_loss(self, M, delta=1e-5):
-        G = _get_Gram(M)
-        return torch.logdet(G + delta * torch.eye(G.size(-1)).repeat(G.size(0), 1, 1)).mean() #.cuda()
-
-    def _get_traceK_loss(self, M):
-        return -_get_matrix_trace(M, 'k').mean()
-
-    # Neighboring loss is currently obtained by maximizing the likelihood
-    # def _get_neigh_loss(self, M, neigh, ori_dist):
-    #     loss_l1 = nn.L1Loss(reduction='none')
-    #     ori_dist = ori_dist.cuda()
-    #     loss_val = loss_l1(_get_neigh_dist(M, neigh),(ori_dist**2))
-    #     norm_term = ori_dist + self.eps
-    #     return (loss_val/norm_term).mean()
 
     def loss(self, model, guide, *args, **kwargs):
         """
@@ -162,8 +96,6 @@ class Loss(ELBO):
 
 
     def loss_and_grads(self, model, guide, *args, **kwargs):
-        # TODO: add argument lambda --> assigns weights to losses
-        # TODO: Normalize loss elbo value if not done
         """
         :returns: returns an estimate of the ELBO
         :rtype: float
@@ -171,18 +103,13 @@ class Loss(ELBO):
         Computes the ELBO as well as the surrogate ELBO that is used to form the gradient estimator.
         Performs backward on the latter. Num_particle many samples are used to form the estimators.
         """
-
         elbo = 0.0
-        dyn_loss = 0.0
-        dim_loss = 0.0
-
         # grab a trace from the generator
         for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
             elbo_particle = 0
             surrogate_elbo_particle = 0
             log_r = None
 
-            ys = []
             # compute elbo and surrogate elbo
             for name, site in model_trace.nodes.items():
                 if site["type"] == "sample":
@@ -204,14 +131,6 @@ class Loss(ELBO):
                         site = log_r.sum_to(site["cond_indep_stack"])
                         surrogate_elbo_particle = surrogate_elbo_particle + (site * score_function_term).sum()
 
-                    if site["name"].startswith("y_"):
-                        # TODO: check order of y
-                        ys.append(site["value"])
-            man = torch.stack(ys, dim=1)
-            mean_man = man.mean(dim=1, keepdims=True)
-            man = man - mean_man
-            dyn_loss += self._get_logdet_loss(man, delta=self.delta)  # TODO: Normalize
-            dim_loss += self._get_traceK_loss(man)
             elbo += elbo_particle / self.num_particles
 
             # collect parameters to train from model and guide
@@ -220,12 +139,11 @@ class Loss(ELBO):
                                    for site in trace.nodes.values())
 
             if trainable_params and getattr(surrogate_elbo_particle, 'requires_grad', False):
-                surrogate_loss_particle = -surrogate_elbo_particle / self.num_particles \
-                                          +self.lam * dyn_loss \
-                                          +self.gam * dim_loss
+                surrogate_loss_particle = -surrogate_elbo_particle / self.num_particles
                 surrogate_loss_particle.backward()
 
         loss = -elbo
         if torch_isnan(loss):
             warnings.warn('Encountered NAN loss')
-        return loss, dyn_loss.item(), dim_loss.item(), man
+        return loss
+
